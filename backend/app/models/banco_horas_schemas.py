@@ -86,9 +86,9 @@ class GerencialResumoResponse(BaseModel):
 
 class GerencialHorasMesResponse(BaseModel):
     month: str
-    trabalhadas: float
+    liquidadas: float
     direito: float
-    descontadas: float
+    perdidas: float
 
 
 class GerencialSaldoSetorResponse(BaseModel):
