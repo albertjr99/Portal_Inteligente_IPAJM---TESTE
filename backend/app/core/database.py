@@ -13,7 +13,7 @@ else:
 engine = create_engine(
     DATABASE_URL,
     connect_args=connect_args,
-    pool_pre_ping=False,
+    pool_pre_ping=True,   # detecta conexões mortas antes de reusar
     pool_recycle=3600,
     pool_timeout=5,        # não espera mais de 5s por uma conexão do pool
 )
