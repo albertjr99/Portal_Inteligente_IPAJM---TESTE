@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Users,
@@ -16,7 +16,7 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { StatCardClickable } from '@/components/StatCardClickable';
-import { fetchSiarhesResumo, type SiarhesResumo } from '@/services/siarhesService';
+import { fetchSiarhesResumo, fetchFrequenciasPorMes, type SiarhesResumo, type ServidorItem, type AfastadoItem, type FeriasItem, type FrequenciasMes } from '@/services/siarhesService';
 
 const proximosPaineis = [
   { title: 'Gestão de Frequências',    desc: 'Controle de presença, faltas e justificativas dos servidores.' },
@@ -33,13 +33,60 @@ export function GerenciarRHPage() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
+  // ── Seletor de mês para frequências ──────────────────────────────────────
+  const hoje = new Date();
+  const mesAnterior = hoje.getMonth() === 0
+    ? { mes: 12, ano: hoje.getFullYear() - 1 }
+    : { mes: hoje.getMonth(), ano: hoje.getFullYear() };
+
+  const [freqMes, setFreqMes] = useState(mesAnterior.mes);
+  const [freqAno, setFreqAno] = useState(mesAnterior.ano);
+  const [freqData, setFreqData] = useState<FrequenciasMes | null>(null);
+  const [freqLoading, setFreqLoading] = useState(false);
+
+  // Gera lista dos últimos 24 meses para o seletor
+  const mesesDisponiveis = (() => {
+    const lista: { label: string; mes: number; ano: number }[] = [];
+    let m = hoje.getMonth() === 0 ? 12 : hoje.getMonth();
+    let a = hoje.getMonth() === 0 ? hoje.getFullYear() - 1 : hoje.getFullYear();
+    for (let i = 0; i < 24; i++) {
+      lista.push({ label: `${String(m).padStart(2, '0')}/${a}`, mes: m, ano: a });
+      m--;
+      if (m === 0) { m = 12; a--; }
+    }
+    return lista;
+  })();
+
+  const loadFreqMes = useCallback(async (ano: number, mes: number) => {
+    setFreqLoading(true);
+    try {
+      const data = await fetchFrequenciasPorMes(ano, mes);
+      setFreqData(data);
+    } catch {
+      setFreqData(null);
+    } finally {
+      setFreqLoading(false);
+    }
+  }, []);
+
+  // Para o mês padrão (anterior), o /resumo já traz os dados — evita chamada dupla.
+  // Só busca via /frequencias/por-mes quando o usuário escolhe um mês diferente.
+  useEffect(() => {
+    if (freqAno === mesAnterior.ano && freqMes === mesAnterior.mes) {
+      setFreqData(null); // usará o fallback do resumo
+      return;
+    }
+    loadFreqMes(freqAno, freqMes);
+  }, [freqAno, freqMes, loadFreqMes]);  // eslint-disable-line react-hooks/exhaustive-deps
+
   const load = async () => {
     setLoading(true);
     setError(null);
     try {
       const data = await fetchSiarhesResumo();
       setResumo(data);
-      setLastUpdated(new Date());
+      // Usa cache_at do backend para mostrar quando os dados foram gerados
+      setLastUpdated(data.cache_at ? new Date(data.cache_at) : new Date());
     } catch (e) {
       setError('Backend indisponível — inicie o servidor para carregar dados reais do SIARHES.');
     } finally {
@@ -49,70 +96,177 @@ export function GerenciarRHPage() {
 
   useEffect(() => { load(); }, []);
 
+  // Helpers de formatação
   const fmt = (v: number | null | undefined) =>
     v !== null && v !== undefined ? String(v) : null;
 
+  const fmtDate = (d: string) => {
+    if (!d) return '';
+    try { return new Date(d).toLocaleDateString('pt-BR', { timeZone: 'UTC' }); }
+    catch { return d; }
+  };
+
+  // Componente reutilizável: lista de servidores num scroll
+  const ListaServidores = ({ items, renderRow }: {
+    items: { numfunc: number | null; nome: string }[];
+    renderRow?: (item: ServidorItem | AfastadoItem | FeriasItem | { numfunc: number | null; nome: string }) => React.ReactNode;
+  }) => (
+    <div className="border rounded-lg overflow-hidden">
+      <div className="max-h-72 overflow-y-auto">
+        {items.length === 0 ? (
+          <p className="text-sm text-muted-foreground p-3 text-center">Nenhum registro encontrado.</p>
+        ) : (
+          <table className="w-full text-sm">
+            <tbody>
+              {items.map((item, i) => (
+                <tr key={i} className={i % 2 === 0 ? 'bg-muted/30' : ''}>
+                  <td className="px-3 py-1.5 text-muted-foreground w-20 font-mono text-xs">{item.numfunc}</td>
+                  <td className="px-3 py-1.5 font-medium">{item.nome}</td>
+                  {renderRow && <td className="px-3 py-1.5">{renderRow(item as never)}</td>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      <div className="px-3 py-1.5 bg-muted/50 border-t text-xs text-muted-foreground">
+        {items.length} registro{items.length !== 1 ? 's' : ''}
+      </div>
+    </div>
+  );
+
   // Conteúdo de detalhes para cada card
-  const getFrequenciasDetails = () => (
-    <div className="space-y-3">
-      <div className="grid grid-cols-2 gap-4">
-        <div className="p-3 rounded-lg bg-blue-50 border border-blue-200">
-          <p className="text-xs text-muted-foreground">Total de Ativos</p>
-          <p className="text-2xl font-bold text-blue-600">{resumo?.frequencias_detalhes?.total_ativos || 0}</p>
-        </div>
-        <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200">
-          <p className="text-xs text-muted-foreground">Com Frequência</p>
-          <p className="text-2xl font-bold text-emerald-600">{resumo?.frequencias_detalhes?.total_com_frequencia || 0}</p>
-        </div>
-      </div>
-      <div className="p-3 rounded-lg bg-amber-50 border border-amber-200">
-        <p className="text-xs text-muted-foreground">Mês de Referência</p>
-        <p className="text-sm font-medium">
-          {resumo?.frequencias_detalhes?.mes_referencia}/{resumo?.frequencias_detalhes?.ano_referencia}
-        </p>
-      </div>
-      <div className="p-3 rounded-lg bg-rose-50 border border-rose-200">
-        <p className="text-xs text-muted-foreground">Sem Frequência</p>
-        <p className="text-2xl font-bold text-rose-600">{resumo?.frequencias_pendentes || 0}</p>
-      </div>
-      <p className="text-xs text-muted-foreground italic">
-        Frequência refere-se ao mês anterior (março). Os servidores listados acima não registraram presença no sistema.
-      </p>
-    </div>
-  );
+  const getFrequenciasDetails = () => {
+    const det = freqData ?? (resumo?.frequencias_detalhes ? {
+      total_ativos: resumo.frequencias_detalhes.total_ativos ?? 0,
+      total_com_frequencia: resumo.frequencias_detalhes.total_com_frequencia ?? 0,
+      frequencias_pendentes: resumo?.frequencias_pendentes ?? 0,
+      mes_referencia: resumo.frequencias_detalhes.mes_referencia ?? freqMes,
+      ano_referencia: resumo.frequencias_detalhes.ano_referencia ?? freqAno,
+      pendentes_lista: resumo?.pendentes_frequencia_lista ?? [],
+    } : null);
+    const pendentes = det?.pendentes_lista ?? [];
 
-  const getColaboradoresDetails = () => (
-    <div className="space-y-3">
-      <div className="p-3 rounded-lg bg-blue-50 border border-blue-200">
-        <p className="text-xs text-muted-foreground">Total de Colaboradores Ativos</p>
-        <p className="text-2xl font-bold text-blue-600">{resumo?.total_colaboradores || 0}</p>
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <div className="p-3 rounded-lg bg-purple-50 border border-purple-200">
-          <p className="text-xs text-muted-foreground">Estagiários</p>
-          <p className="text-xl font-bold text-purple-600">{resumo?.estagiarios || 0}</p>
+    return (
+      <div className="space-y-3">
+        {/* Seletor de mês */}
+        <div className="flex items-center gap-2">
+          <label className="text-xs font-medium text-muted-foreground whitespace-nowrap">Mês de referência:</label>
+          <select
+            className="text-sm border rounded-md px-2 py-1 bg-background flex-1"
+            value={`${freqAno}-${String(freqMes).padStart(2,'0')}`}
+            onChange={(e) => {
+              const [a, m] = e.target.value.split('-').map(Number);
+              setFreqAno(a);
+              setFreqMes(m);
+            }}
+          >
+            {mesesDisponiveis.map(({ label, mes, ano }) => (
+              <option key={label} value={`${ano}-${String(mes).padStart(2,'0')}`}>{label}</option>
+            ))}
+          </select>
+          {freqLoading && <RefreshCw className="size-3 animate-spin text-muted-foreground shrink-0" />}
         </div>
-        <div className="p-3 rounded-lg bg-indigo-50 border border-indigo-200">
-          <p className="text-xs text-muted-foreground">Comissionados</p>
-          <p className="text-xl font-bold text-indigo-600">{resumo?.comissionados || 0}</p>
-        </div>
-      </div>
-      <p className="text-xs text-muted-foreground italic">
-        Inclui todos os vínculos ativos (efetivos, comissionados e estagiários).
-      </p>
-    </div>
-  );
 
-  const getAfastadosDetails = () => (
-    <div className="space-y-3">
-      <div className="p-3 rounded-lg bg-rose-50 border border-rose-200">
-        <p className="text-xs text-muted-foreground">Total de Afastados</p>
-        <p className="text-2xl font-bold text-rose-600">{resumo?.afastados || 0}</p>
+        <div className="grid grid-cols-3 gap-3">
+          <div className="p-3 rounded-lg bg-blue-50 border border-blue-200 text-center">
+            <p className="text-xs text-muted-foreground">Servidores Ativos</p>
+            <p className="text-2xl font-bold text-blue-600">{freqLoading ? '…' : (det?.total_ativos ?? 0)}</p>
+          </div>
+          <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-center">
+            <p className="text-xs text-muted-foreground">Com Frequência</p>
+            <p className="text-2xl font-bold text-emerald-600">{freqLoading ? '…' : (det?.total_com_frequencia ?? 0)}</p>
+          </div>
+          <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-center">
+            <p className="text-xs text-muted-foreground">Pendentes</p>
+            <p className="text-2xl font-bold text-rose-600">{freqLoading ? '…' : (det?.frequencias_pendentes ?? 0)}</p>
+          </div>
+        </div>
+        <div className="p-2 rounded bg-amber-50 border border-amber-200 text-xs text-amber-800">
+          Referência: {String(freqMes).padStart(2,'0')}/{freqAno} — servidores sem frequência lançada no sistema
+        </div>
+        {!freqLoading && pendentes.length > 0 && (
+          <>
+            <p className="text-sm font-semibold">Servidores sem frequência:</p>
+            <ListaServidores items={pendentes} />
+          </>
+        )}
+        {!freqLoading && pendentes.length === 0 && det !== null && (
+          <p className="text-sm text-emerald-600 text-center py-2">Todos os servidores com frequência lançada ✓</p>
+        )}
       </div>
-      {resumo?.afastados_por_tipo && Object.keys(resumo.afastados_por_tipo).length > 0 && (
-        <div className="space-y-2">
-          <p className="text-sm font-semibold">Detalhamento por Tipo:</p>
+    );
+  };
+
+  const getColaboradoresDetails = () => {
+    const lista = resumo?.colaboradores_lista ?? [];
+    const estagiarios = lista.filter(v => v.tipoVinculo?.toUpperCase().includes('ESTAG'));
+    const comissionados = lista.filter(v => ['COMISSIONADO','DT'].includes(v.tipoVinculo?.toUpperCase() ?? ''));
+    const outros = lista.filter(v => !v.tipoVinculo?.toUpperCase().includes('ESTAG') && !['COMISSIONADO','DT'].includes(v.tipoVinculo?.toUpperCase() ?? ''));
+    return (
+      <div className="space-y-3">
+        <div className="grid grid-cols-3 gap-3">
+          <div className="p-3 rounded-lg bg-blue-50 border border-blue-200 text-center">
+            <p className="text-xs text-muted-foreground">Total</p>
+            <p className="text-2xl font-bold text-blue-600">{resumo?.total_colaboradores ?? 0}</p>
+          </div>
+          <div className="p-3 rounded-lg bg-purple-50 border border-purple-200 text-center">
+            <p className="text-xs text-muted-foreground">Estagiários</p>
+            <p className="text-2xl font-bold text-purple-600">{estagiarios.length}</p>
+          </div>
+          <div className="p-3 rounded-lg bg-indigo-50 border border-indigo-200 text-center">
+            <p className="text-xs text-muted-foreground">Comissionados</p>
+            <p className="text-2xl font-bold text-indigo-600">{comissionados.length}</p>
+          </div>
+        </div>
+        {outros.length > 0 && (
+          <>
+            <p className="text-sm font-semibold">Efetivos / Outros ({outros.length})</p>
+            <ListaServidores items={outros} renderRow={(item) => (
+              <span className="text-xs text-muted-foreground">{(item as ServidorItem).tipoVinculo}</span>
+            )} />
+          </>
+        )}
+        {comissionados.length > 0 && (
+          <>
+            <p className="text-sm font-semibold">Comissionados / DT ({comissionados.length})</p>
+            <ListaServidores items={comissionados} />
+          </>
+        )}
+        {estagiarios.length > 0 && (
+          <>
+            <p className="text-sm font-semibold">Estagiários ({estagiarios.length})</p>
+            <ListaServidores items={estagiarios} />
+          </>
+        )}
+      </div>
+    );
+  };
+
+  const getEstagiarioDetails = () => {
+    const lista = (resumo?.colaboradores_lista ?? []).filter(v => v.tipoVinculo?.toUpperCase().includes('ESTAG'));
+    return (
+      <div className="space-y-3">
+        <div className="p-3 rounded-lg bg-purple-50 border border-purple-200 text-center">
+          <p className="text-xs text-muted-foreground">Total de Estagiários Ativos</p>
+          <p className="text-2xl font-bold text-purple-600">{lista.length}</p>
+        </div>
+        <ListaServidores items={lista} />
+      </div>
+    );
+  };
+
+  const getAfastadosDetails = () => {
+    const lista = resumo?.afastados_lista ?? [];
+    return (
+      <div className="space-y-3">
+        <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-center">
+          <p className="text-xs text-muted-foreground">Total de Afastados</p>
+          <p className="text-2xl font-bold text-rose-600">{resumo?.afastados ?? 0}</p>
+        </div>
+        {resumo?.afastados_por_tipo && Object.keys(resumo.afastados_por_tipo).length > 0 && (
           <div className="space-y-1">
+            <p className="text-sm font-semibold">Por tipo:</p>
             {Object.entries(resumo.afastados_por_tipo).map(([tipo, qtd]) => (
               <div key={tipo} className="flex justify-between items-center p-2 rounded bg-muted/50">
                 <span className="text-sm">{tipo}</span>
@@ -120,31 +274,72 @@ export function GerenciarRHPage() {
               </div>
             ))}
           </div>
-        </div>
-      )}
-      <p className="text-xs text-muted-foreground italic">
-        Inclui licenças médicas, maternidade/paternidade, afastamentos e outros.
-      </p>
-    </div>
-  );
-
-  const getFeriasDetails = () => (
-    <div className="space-y-3">
-      <div className="grid grid-cols-2 gap-4">
-        <div className="p-3 rounded-lg bg-cyan-50 border border-cyan-200">
-          <p className="text-xs text-muted-foreground">Com Saldo</p>
-          <p className="text-2xl font-bold text-cyan-600">{resumo?.ferias_com_saldo || 0}</p>
-        </div>
-        <div className="p-3 rounded-lg bg-orange-50 border border-orange-200">
-          <p className="text-xs text-muted-foreground">A Vencer (6 meses)</p>
-          <p className="text-2xl font-bold text-orange-600">{resumo?.ferias_a_vencer || 0}</p>
-        </div>
+        )}
+        {lista.length > 0 && (
+          <>
+            <p className="text-sm font-semibold">Servidores afastados:</p>
+            <ListaServidores items={lista} renderRow={(item) => {
+              const a = item as AfastadoItem;
+              return (
+                <span className="text-xs text-muted-foreground">
+                  {a.tipo}{a.dataInicio ? ` — desde ${fmtDate(a.dataInicio)}` : ''}
+                </span>
+              );
+            }} />
+          </>
+        )}
       </div>
-      <p className="text-xs text-muted-foreground italic">
-        Férias a vencer referem-se aos próximos 6 meses a partir de hoje.
-      </p>
-    </div>
-  );
+    );
+  };
+
+  const getFeriasDetails = () => {
+    const listaVencer = resumo?.ferias_a_vencer_lista ?? [];
+    const listaSaldo  = resumo?.ferias_lista ?? [];
+    return (
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <div className="p-3 rounded-lg bg-cyan-50 border border-cyan-200 text-center">
+            <p className="text-xs text-muted-foreground">Com Saldo</p>
+            <p className="text-2xl font-bold text-cyan-600">{resumo?.ferias_com_saldo ?? 0}</p>
+          </div>
+          <div className="p-3 rounded-lg bg-orange-50 border border-orange-200 text-center">
+            <p className="text-xs text-muted-foreground">A Vencer (6 meses)</p>
+            <p className="text-2xl font-bold text-orange-600">{resumo?.ferias_a_vencer ?? 0}</p>
+          </div>
+        </div>
+        {listaVencer.length > 0 && (
+          <>
+            <p className="text-sm font-semibold">A vencer nos próximos 6 meses:</p>
+            <ListaServidores items={listaVencer} renderRow={(item) => {
+              const f = item as FeriasItem;
+              return (
+                <span className="text-xs text-muted-foreground">
+                  {f.saldo}d — prescrição: {f.prescricao ? fmtDate(f.prescricao) : 'N/A'}
+                </span>
+              );
+            }} />
+          </>
+        )}
+        {listaSaldo.length > listaVencer.length && (
+          <details>
+            <summary className="text-sm font-semibold cursor-pointer text-muted-foreground">
+              Ver todos com saldo ({listaSaldo.length})
+            </summary>
+            <div className="mt-2">
+              <ListaServidores items={listaSaldo} renderRow={(item) => {
+                const f = item as FeriasItem;
+                return (
+                  <span className="text-xs text-muted-foreground">
+                    {f.saldo}d — {f.prescricao ? fmtDate(f.prescricao) : 'N/A'}
+                  </span>
+                );
+              }} />
+            </div>
+          </details>
+        )}
+      </div>
+    );
+  };
 
   const cards = [
     {
@@ -160,8 +355,8 @@ export function GerenciarRHPage() {
     },
     {
       label: 'Frequências pendentes',
-      value: fmt(resumo?.frequencias_pendentes),
-      description: 'Sem frequência em março',
+      value: freqLoading ? null : fmt(freqData?.frequencias_pendentes ?? resumo?.frequencias_pendentes),
+      description: `Sem frequência em ${String(freqMes).padStart(2,'0')}/${freqAno}`,
       icon: ClipboardList,
       color: 'text-amber-600',
       bgColor: 'bg-amber-50',
@@ -177,6 +372,8 @@ export function GerenciarRHPage() {
       color: 'text-emerald-600',
       bgColor: 'bg-emerald-50',
       err: !!resumo?.errors?.vinculos,
+      detailsTitle: 'Estagiários Ativos',
+      detailsContent: getEstagiarioDetails(),
     },
     {
       label: 'Colaboradores afastados',
@@ -197,6 +394,8 @@ export function GerenciarRHPage() {
       color: 'text-purple-600',
       bgColor: 'bg-purple-50',
       err: !!resumo?.errors?.vinculos,
+      detailsTitle: 'Estagiários Ativos',
+      detailsContent: getEstagiarioDetails(),
     },
     {
       label: 'Férias previstas',
@@ -239,7 +438,7 @@ export function GerenciarRHPage() {
           {/* Status badge */}
           {loading ? (
             <span className="text-xs text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-full flex items-center gap-1">
-              <RefreshCw className="size-3 animate-spin" /> Consultando SIARHES — pode levar até 60s...
+              <RefreshCw className="size-3 animate-spin" /> Consultando SIARHES...
             </span>
           ) : backendOk ? (
             <span className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full flex items-center gap-1">
@@ -253,7 +452,7 @@ export function GerenciarRHPage() {
 
           {lastUpdated && (
             <span className="text-xs text-muted-foreground ml-auto">
-              Atualizado às {lastUpdated.toLocaleTimeString('pt-BR')}
+              Cache gerado às {lastUpdated.toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' })}
             </span>
           )}
           <Button variant="ghost" size="sm" className="h-6 px-2" onClick={load} disabled={loading}>
