@@ -117,6 +117,42 @@ async def contracheque(
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@router.get("/carreira/progressao", summary="Progressão de carreira do servidor")
+async def progressao_carreira(
+    numfunc: int | None = Query(default=None, description="Número funcional do servidor (opcional se informar nome)"),
+    nome: str | None = Query(default=None, description="Nome completo do servidor (usado quando numfunc não está disponível)"),
+    empresa: int = Query(svc.EMPRESA_IPAJM),
+) -> dict[str, Any]:
+    """
+    Retorna a progressão de carreira do servidor via SIARHES.
+    Aceita numfunc ou nome (fullName do AD) para localizar o vínculo.
+    """
+    if numfunc is None and not nome:
+        raise HTTPException(status_code=422, detail="Informe numfunc ou nome")
+    try:
+        return await svc.get_progressao_carreira(numfunc=numfunc, nome=nome, empresa=empresa)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Erro ao consultar progressão: {exc}")
+
+
+@router.get("/carreira/capacitacoes", summary="Histórico de capacitações/cursos do servidor")
+async def capacitacoes_servidor(
+    numfunc: int | None = Query(default=None, description="Número funcional do servidor"),
+    nome: str | None = Query(default=None, description="Nome completo (usado quando numfunc não está disponível)"),
+    empresa: int = Query(svc.EMPRESA_IPAJM),
+) -> list[dict[str, Any]]:
+    """
+    Retorna todos os cursos e capacitações registrados no SIARHES para o servidor.
+    Aceita numfunc OU nome. Ordenados por data de início decrescente.
+    """
+    if numfunc is None and not nome:
+        raise HTTPException(status_code=422, detail="Informe numfunc ou nome")
+    try:
+        return await svc.get_capacitacoes_servidor(numfunc=numfunc, nome=nome, empresa=empresa)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Erro ao consultar capacitações: {exc}")
+
+
 # --- Frequencias ---
 
 @router.get("/frequencias/pendentes", summary="Servidores sem frequencia no mes anterior")
@@ -129,3 +165,73 @@ async def frequencias_pendentes(empresa: int = Query(svc.EMPRESA_IPAJM)) -> dict
         return await svc.get_frequencias_pendentes(empresa)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.get("/frequencias/por-mes", summary="Analise de frequencias para um mes/ano especifico")
+async def frequencias_por_mes(
+    ano: int = Query(..., ge=2000, le=2100, description="Ano de referência"),
+    mes: int = Query(..., ge=1, le=12, description="Mês de referência (1-12)"),
+    empresa: int = Query(svc.EMPRESA_IPAJM),
+) -> dict[str, Any]:
+    """
+    Retorna pendentes, com_frequencia e lista de servidores sem frequência
+    para o mês/ano indicado. Não utiliza o cache do resumo geral — consulta
+    os vínculos e frequências diretamente (pode ser lento na primeira chamada).
+    """
+    try:
+        from datetime import datetime
+        from app.services.siarhes_service import BRT, _fetch_all_pages, _fetch_frequencias_mes
+
+        hoje = datetime.now(BRT)
+        data_ref = hoje.strftime("%Y-%m-%dT00:00:00")
+        hoje_date = hoje.date()
+
+        vinculos_raw = await _fetch_all_pages(
+            "/v2/rh/Vinculos",
+            {"codigoEmpresa": empresa, "dataRef": data_ref},
+        )
+
+        # Filtra vínculos ativos
+        ativos = []
+        for v in vinculos_raw:
+            vac = v.get("dataVacancia")
+            if vac:
+                try:
+                    if datetime.fromisoformat(str(vac)[:10]).date() <= hoje_date:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            apos = v.get("dataAposentadoria")
+            if apos:
+                try:
+                    if datetime.fromisoformat(str(apos)[:10]).date() <= hoje_date:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            ativos.append(v)
+
+        nome_map = {str(v.get("numfunc")): v.get("nome") or "" for v in ativos if v.get("numfunc")}
+        ativos_set = {str(v.get("numfunc") or "") for v in ativos if v.get("numfunc")}
+
+        all_freq = await _fetch_frequencias_mes(empresa, 1, ano, mes)
+        com_freq_set = {str(f.get("numfunc") or "").strip() for f in all_freq if f.get("numfunc")}
+
+        pendentes_set = ativos_set - com_freq_set
+        pendentes_lista = sorted(
+            [
+                {"numfunc": int(nf) if nf.isdigit() else nf, "nome": nome_map.get(nf) or "Nome não disponível"}
+                for nf in pendentes_set
+            ],
+            key=lambda x: str(x.get("nome") or ""),
+        )
+
+        return {
+            "total_ativos":         len(ativos),
+            "total_com_frequencia": len(com_freq_set),
+            "frequencias_pendentes": len(pendentes_set),
+            "mes_referencia":       mes,
+            "ano_referencia":       ano,
+            "pendentes_lista":      pendentes_lista,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Erro ao consultar SIARHES: {exc}")
