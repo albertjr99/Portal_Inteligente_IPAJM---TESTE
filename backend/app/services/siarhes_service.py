@@ -142,7 +142,6 @@ async def get_vinculos_resumo(empresa: int = EMPRESA_IPAJM) -> dict:
     hoje_date = datetime.utcnow().date()
     ativos: list[dict] = []
     for v in todos:
-        situacao = str(v.get("situacao") or "").upper()
         vacancia_raw = v.get("dataVacancia")
         if vacancia_raw:
             try:
@@ -302,124 +301,190 @@ async def get_ficha_financeira(numfunc: int, ano: int, mes: int) -> dict:
     )
 
 
-async def get_frequencias_mes(empresa: int = EMPRESA_IPAJM, ano: int | None = None, mes: int | None = None) -> dict:
+async def _fetch_frequencias_mes(empresa: int, ano: int, mes: int) -> list[dict]:
     """
-    Busca frequências registradas para um mês específico.
-    Se não informar ano/mês, usa o mês anterior (já que frequência é sempre do mês anterior).
-    
-    Retorna:
-    - total_com_frequencia: quantidade de servidores com frequência registrada
-    - servidores_com_frequencia: lista de numfunc com frequência
-    - raw_error: erro se houver
+    Busca os registros de frequência lançados para o mês/ano indicado.
+    Retorna lista bruta (pode ser vazia se endpoint não existir ou não houver dados).
     """
-    hoje = datetime.utcnow().date()
-    
-    # Se não informar, usa mês anterior
-    if ano is None or mes is None:
-        if hoje.month == 1:
-            mes = 12
-            ano = hoje.year - 1
-        else:
-            mes = hoje.month - 1
-            ano = hoje.year
-    
     try:
-        # Busca frequências do mês especificado
-        frequencias = await _fetch_all_pages(
+        return await _fetch_all_pages(
             "/v2/rh/Frequencias",
             {"codigoEmpresa": empresa, "anoRef": ano, "mesRef": mes},
         )
     except Exception as exc:
-        logger.error("get_frequencias_mes: %s", exc)
-        return {
-            "total_com_frequencia": None,
-            "servidores_com_frequencia": [],
-            "raw_error": str(exc)
-        }
-    
-    # Extrai numfunc únicos (alguns podem ter múltiplos registros)
-    numfuncs_com_frequencia = set()
-    for freq in frequencias:
-        numfunc = freq.get("numfunc")
-        if numfunc:
-            numfuncs_com_frequencia.add(numfunc)
-    
-    return {
-        "total_com_frequencia": len(numfuncs_com_frequencia),
-        "servidores_com_frequencia": list(numfuncs_com_frequencia),
-        "mes": mes,
-        "ano": ano,
+        logger.warning("_fetch_frequencias_mes: %s", exc)
+        return []
+
+
+async def get_frequencias_pendentes(
+    empresa: int = EMPRESA_IPAJM,
+    vinculos_raw: list[dict] | None = None,
+) -> dict:
+    """
+    Conta servidores ativos com frequência pendente no mês atual.
+
+    Parâmetro opcional ``vinculos_raw``:
+      - Se fornecido (lista bruta já buscada), evita uma chamada duplicada à
+        API de vínculos — padrão de uso dentro de ``get_resumo_geral``.
+      - Se omitido, busca os vínculos internamente (uso standalone).
+    """
+    from datetime import timezone
+
+    hoje = datetime.now(timezone.utc)
+    ano, mes = hoje.year, hoje.month
+
+    # ── Busca vínculos brutos (se não fornecidos) ─────────────────────────────
+    if vinculos_raw is None:
+        data_ref = hoje.strftime("%Y-%m-%dT00:00:00")
+        try:
+            vinculos_raw = await _fetch_all_pages(
+                "/v2/rh/Vinculos",
+                {"codigoEmpresa": empresa, "dataRef": data_ref},
+            )
+        except Exception as exc:
+            logger.error("get_frequencias_pendentes (vínculos): %s", exc)
+            return {"pendentes": None, "raw_error": str(exc)}
+
+    # ── Busca frequências do mês ───────────────────────────────────────────────
+    frequencias = await _fetch_frequencias_mes(empresa, ano, mes)
+
+    # numfuncs que já têm frequência lançada no mês
+    com_frequencia: set[str] = {
+        str(f.get("numfunc") or f.get("matricula") or "").strip()
+        for f in frequencias
+        if f.get("numfunc") or f.get("matricula")
     }
 
+    # Filtra vínculos ativos (mesma lógica de get_vinculos_resumo)
+    hoje_date = hoje.date()
+    pendentes = 0
+    for v in vinculos_raw:
+        vacancia_raw = v.get("dataVacancia")
+        if vacancia_raw:
+            try:
+                if datetime.fromisoformat(str(vacancia_raw)[:10]).date() <= hoje_date:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        aposentadoria_raw = v.get("dataAposentadoria")
+        if aposentadoria_raw:
+            try:
+                if datetime.fromisoformat(str(aposentadoria_raw)[:10]).date() <= hoje_date:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        numfunc = str(v.get("numfunc") or v.get("matricula") or "").strip()
+        if numfunc and numfunc not in com_frequencia:
+            pendentes += 1
 
-async def get_frequencias_pendentes(empresa: int = EMPRESA_IPAJM) -> dict:
-    """
-    Calcula quantos servidores ATIVOS não fizeram frequência no mês anterior.
-    
-    Lógica:
-    1. Busca total de servidores ativos
-    2. Busca frequências do mês anterior
-    3. Retorna: total_ativos - total_com_frequencia = frequencias_pendentes
-    """
-    import asyncio
-    
-    try:
-        # Busca dados em paralelo
-        vinculos_task = get_vinculos_resumo(empresa)
-        frequencias_task = get_frequencias_mes(empresa)
-        
-        vinculos_result, frequencias_result = await asyncio.gather(
-            vinculos_task, frequencias_task,
-            return_exceptions=True,
-        )
-        
-        def _safe(result, key, default=None):
-            if isinstance(result, (Exception, type(None))):
-                return default
-            return result.get(key, default)
-        
-        total_ativos = _safe(vinculos_result, "total_ativos", 0) or 0
-        total_com_frequencia = _safe(frequencias_result, "total_com_frequencia", 0) or 0
-        servidores_com_frequencia = _safe(frequencias_result, "servidores_com_frequencia", [])
-        
-        frequencias_pendentes = max(0, total_ativos - total_com_frequencia)
-        
-        return {
-            "frequencias_pendentes": frequencias_pendentes,
-            "total_ativos": total_ativos,
-            "total_com_frequencia": total_com_frequencia,
-            "servidores_com_frequencia": servidores_com_frequencia,
-            "mes_referencia": frequencias_result.get("mes") if not isinstance(frequencias_result, Exception) else None,
-            "ano_referencia": frequencias_result.get("ano") if not isinstance(frequencias_result, Exception) else None,
-        }
-    except Exception as exc:
-        logger.error("get_frequencias_pendentes: %s", exc)
-        return {
-            "frequencias_pendentes": None,
-            "raw_error": str(exc),
-        }
+    return {"pendentes": pendentes}
 
 
 async def get_resumo_geral(empresa: int = EMPRESA_IPAJM) -> dict:
     """
     Agrega todos os indicadores de RH em uma única chamada de resumo.
     Usado pelo painel GerenciarRH. Resultado em cache por 5 minutos.
+
+    Estratégia de performance:
+      1. Dispara 4 chamadas ao SIARHES em paralelo via asyncio.gather:
+         vínculos brutos, afastamentos, férias e frequências do mês.
+      2. Processa frequências pendentes localmente reusando os vínculos
+         já buscados — zero chamadas duplicadas à API.
     """
     global _resumo_cache, _resumo_cache_expires
     import asyncio
+    from datetime import timezone
 
     if _resumo_cache and _resumo_cache_expires and datetime.utcnow() < _resumo_cache_expires:
         logger.debug("get_resumo_geral: retornando cache")
         return _resumo_cache
 
-    vinculos_task    = get_vinculos_resumo(empresa)
-    afastados_task   = get_afastamentos_ativos(empresa)
-    ferias_task      = get_ferias_previstas(empresa)
+    hoje = datetime.now(timezone.utc)
+    data_ref = hoje.strftime("%Y-%m-%dT00:00:00")
 
-    vinculos, afastados, ferias = await asyncio.gather(
-        vinculos_task, afastados_task, ferias_task,
+    # ── Fase única: todas as 4 chamadas à API em paralelo ────────────────────
+    # Vínculos, afastamentos, férias e frequências são disparados juntos.
+    # O tempo total passa a ser max(t1, t2, t3, t4) em vez de t1+t2+t3+t4.
+    vinculos_raw, afastados, ferias, freq_raw = await asyncio.gather(
+        _fetch_all_pages(
+            "/v2/rh/Vinculos",
+            {"codigoEmpresa": empresa, "dataRef": data_ref},
+        ),
+        get_afastamentos_ativos(empresa),
+        get_ferias_previstas(empresa),
+        _fetch_frequencias_mes(empresa, hoje.year, hoje.month),
         return_exceptions=True,
     )
+
+    # ── Processa vínculos (igual a get_vinculos_resumo, sem nova chamada) ─────
+    def _proc_vinculos(raw) -> dict:
+        if isinstance(raw, Exception):
+            return {
+                "total_ativos": None, "estagiarios": None, "comissionados": None,
+                "raw_error": str(raw), "_raw_list": [],
+            }
+        hoje_date = datetime.utcnow().date()
+        ativos: list[dict] = []
+        for v in raw:
+            vacancia_raw = v.get("dataVacancia")
+            if vacancia_raw:
+                try:
+                    if datetime.fromisoformat(str(vacancia_raw)[:10]).date() <= hoje_date:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            aposentadoria_raw = v.get("dataAposentadoria")
+            if aposentadoria_raw:
+                try:
+                    if datetime.fromisoformat(str(aposentadoria_raw)[:10]).date() <= hoje_date:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            ativos.append(v)
+        estagiarios   = [v for v in ativos if "ESTAG" in str(v.get("tipoVinculo") or "").upper()]
+        comissionados = [v for v in ativos if str(v.get("tipoVinculo") or "").upper() in ("COMISSIONADO", "DT")]
+        return {
+            "total_ativos":  len(ativos),
+            "estagiarios":   len(estagiarios),
+            "comissionados": len(comissionados),
+            "_raw_list":     raw,  # reaproveitado no cálculo de pendentes
+        }
+
+    # ── Processa frequências pendentes reusando vínculos já buscados ──────────
+    def _proc_freq_pendentes(vinculos_dict: dict, freq_list) -> dict:
+        raw_list = vinculos_dict.get("_raw_list") or []
+        if not raw_list or isinstance(freq_list, Exception):
+            return {"pendentes": None}
+        freq_list = freq_list if isinstance(freq_list, list) else []
+        com_frequencia: set[str] = {
+            str(f.get("numfunc") or f.get("matricula") or "").strip()
+            for f in freq_list
+            if f.get("numfunc") or f.get("matricula")
+        }
+        hoje_date = datetime.utcnow().date()
+        pendentes = 0
+        for v in raw_list:
+            vacancia_raw = v.get("dataVacancia")
+            if vacancia_raw:
+                try:
+                    if datetime.fromisoformat(str(vacancia_raw)[:10]).date() <= hoje_date:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            aposentadoria_raw = v.get("dataAposentadoria")
+            if aposentadoria_raw:
+                try:
+                    if datetime.fromisoformat(str(aposentadoria_raw)[:10]).date() <= hoje_date:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            numfunc = str(v.get("numfunc") or v.get("matricula") or "").strip()
+            if numfunc and numfunc not in com_frequencia:
+                pendentes += 1
+        return {"pendentes": pendentes}
+
+    vinculos = _proc_vinculos(vinculos_raw)
+    freq_res = _proc_freq_pendentes(vinculos, freq_raw)
 
     def _safe(result, key, default=None):
         if isinstance(result, (Exception, type(None))):
@@ -433,33 +498,24 @@ async def get_resumo_geral(empresa: int = EMPRESA_IPAJM) -> dict:
             return result["raw_error"]
         return None
 
-    frequencias_task = get_frequencias_pendentes(empresa)
-    frequencias = await frequencias_task
-
     result = {
-        "total_colaboradores": _safe(vinculos,  "total_ativos"),
-        "estagiarios":         _safe(vinculos,  "estagiarios"),
-        "comissionados":       _safe(vinculos,  "comissionados"),
-        "afastados":           _safe(afastados, "total_afastados"),
-        "afastados_por_tipo":  _safe(afastados, "por_tipo", {}),
-        "ferias_com_saldo":    _safe(ferias,    "com_saldo"),
-        "ferias_a_vencer":     _safe(ferias,    "proximas_a_vencer"),
-        "frequencias_pendentes": _safe(frequencias, "frequencias_pendentes"),
-        "frequencias_detalhes": {
-            "total_ativos": _safe(frequencias, "total_ativos"),
-            "total_com_frequencia": _safe(frequencias, "total_com_frequencia"),
-            "mes_referencia": _safe(frequencias, "mes_referencia"),
-            "ano_referencia": _safe(frequencias, "ano_referencia"),
-        },
+        "total_colaboradores":   _safe(vinculos,  "total_ativos"),
+        "estagiarios":           _safe(vinculos,  "estagiarios"),
+        "comissionados":         _safe(vinculos,  "comissionados"),
+        "afastados":             _safe(afastados, "total_afastados"),
+        "afastados_por_tipo":    _safe(afastados, "por_tipo", {}),
+        "ferias_com_saldo":      _safe(ferias,    "com_saldo"),
+        "ferias_a_vencer":       _safe(ferias,    "proximas_a_vencer"),
+        "frequencias_pendentes": freq_res.get("pendentes"),
         "errors": {
-            "vinculos":  _err(vinculos),
-            "afastados": _err(afastados),
-            "ferias":    _err(ferias),
-            "frequencias": _err(frequencias),
+            "vinculos":    _err(vinculos),
+            "afastados":   _err(afastados),
+            "ferias":      _err(ferias),
+            "frequencias": None if isinstance(freq_raw, list) else str(freq_raw),
         },
     }
 
-    # Só armazena em cache se não houve erros em vinculos (dados principais)
+    # Só armazena em cache se os dados principais não tiveram erros
     if not _err(vinculos):
         _resumo_cache = result
         _resumo_cache_expires = datetime.utcnow() + RESUMO_CACHE_TTL
