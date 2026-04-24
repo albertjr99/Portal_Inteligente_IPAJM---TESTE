@@ -15,11 +15,12 @@ MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
 MYSQL_DB = os.getenv("MYSQL_DB", "portal_ipajm")
 
-# Variável de ambiente configurável, agora utilizando MySQL por padrão
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    f"mysql+pymysql://{MYSQL_USER}:{quote_plus(MYSQL_PASSWORD)}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
-)
+# Usa MySQL se as credenciais estiverem definidas via env; caso contrário usa SQLite local
+_mysql_url = f"mysql+pymysql://{MYSQL_USER}:{quote_plus(MYSQL_PASSWORD)}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
+_sqlite_url = "sqlite:///./portal_ipajm.db"
+_default_db = _mysql_url if os.getenv("MYSQL_USER") or os.getenv("DATABASE_URL") else _sqlite_url
+
+DATABASE_URL = os.getenv("DATABASE_URL", _default_db)
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.servidor.com.br")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
