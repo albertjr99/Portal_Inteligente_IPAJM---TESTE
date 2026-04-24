@@ -71,6 +71,84 @@ def _fetch_srh_records() -> list:
 
 router = APIRouter()
 
+
+_STOP_WORDS = {"DE", "DA", "DO", "DOS", "DAS", "E", "A", "O"}
+
+
+def _normalize_nome(text: str) -> str:
+    """Remove acentos, converte para maiúsculas e elimina espaços extras."""
+    import unicodedata
+    return (
+        unicodedata.normalize("NFD", text)
+        .encode("ascii", "ignore")
+        .decode()
+        .upper()
+        .strip()
+    )
+
+
+def _nome_tokens(text: str) -> set[str]:
+    """Retorna tokens significativos do nome (sem preposições)."""
+    return {t for t in _normalize_nome(text).split() if t not in _STOP_WORDS}
+
+
+def _nome_score(srh_nome: str, input_nome: str) -> float:
+    """
+    Calcula similaridade por sobreposição de tokens.
+    Retorna fração dos tokens do input que também aparecem no nome SRH.
+    """
+    srh_tokens = _nome_tokens(srh_nome)
+    input_tokens = _nome_tokens(input_nome)
+    if not input_tokens:
+        return 0.0
+    return len(srh_tokens & input_tokens) / len(input_tokens)
+
+
+@router.get("/srh/extrato")
+def srh_extrato_por_nome(nome: str = Query(...)):
+    """
+    Proxy para o sistema SRH externo com filtro de nome robusto.
+    Tenta match exato primeiro; se não encontrar, usa sobreposição de tokens
+    (≥ 70 % dos tokens do nome do usuário devem constar no nome SRH).
+    Isso tolera pequenas variações ortográficas (ex: Correia ↔ Correa).
+    """
+    if not nome.strip():
+        raise HTTPException(status_code=400, detail="Parâmetro nome é obrigatório")
+
+    try:
+        url = f"{SRH_BASE_URL}/api/dias-trabalhados"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            todos = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logger.warning("srh_extrato_por_nome: falha SRH externo: %s", exc)
+        raise HTTPException(status_code=502, detail="Não foi possível contactar o sistema SRH externo")
+
+    if isinstance(todos, dict):
+        todos = todos.get("registros") or todos.get("dias_trabalhados") or []
+    if not isinstance(todos, list):
+        todos = []
+
+    nome_norm = _normalize_nome(nome)
+
+    # 1) Match exato (normalizado)
+    registros = [r for r in todos if _normalize_nome(str(r.get("nome") or "")) == nome_norm]
+
+    match_type = "exato"
+
+    # 2) Fallback por sobreposição de tokens (≥ 70 %)
+    if not registros:
+        THRESHOLD = 0.70
+        registros = [r for r in todos if _nome_score(str(r.get("nome") or ""), nome) >= THRESHOLD]
+        match_type = "aproximado"
+
+    logger.info(
+        "srh_extrato_por_nome: nome=%r match=%s → %d/%d registros",
+        nome, match_type, len(registros), len(todos),
+    )
+    return registros
+
+
 @router.post("/dias-trabalhados", response_model=DiaTrabalhadoResponse, status_code=status.HTTP_201_CREATED)
 def criar_dia_trabalhado(dia: DiaTrabalhadoCreate, db: Session = Depends(get_db)):
     # Calcular horas
@@ -246,9 +324,9 @@ def dashboard_gerencial(
     horas_por_mes = [
         GerencialHorasMesResponse(
             month=month,
-            trabalhadas=round(values["trabalhadas"] / 60, 2),
+            liquidadas=round(values["trabalhadas"] / 60, 2),
             direito=round(values["direito"] / 60, 2),
-            descontadas=round(values["descontadas"] / 60, 2),
+            perdidas=round(values["descontadas"] / 60, 2),
         )
         for month, values in sorted(monthly.items())
     ]
