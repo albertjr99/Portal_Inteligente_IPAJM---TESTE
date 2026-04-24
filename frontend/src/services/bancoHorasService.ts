@@ -37,32 +37,20 @@ const SRH_BASE = 'https://srh.pythonanywhere.com';
 } */}
 
 export async function fetchBancoHorasPorNome(nome: string): Promise<DiaTrabalhado[]> {
+  // Usa nosso backend como proxy: faz filtro com match exato normalizado
+  // evitando o fuzzy-match da API externa que pode retornar outro servidor.
   const nomeEncoded = encodeURIComponent(nome);
-
-  let res = await fetch(`${SRH_BASE}/api/consulta-por-nome/${nomeEncoded}`);
-
-  if (!res.ok) {
-    res = await fetch(`${SRH_BASE}/api/dias-trabalhados?nome=${nomeEncoded}`);
-  }
+  const res = await fetch(`/api/banco-horas/srh/extrato?nome=${nomeEncoded}`);
 
   if (!res.ok) {
-    throw new Error('Servidor não encontrado no sistema.');
+    throw new Error('Não foi possível carregar os dados de banco de horas.');
   }
 
   const data = await res.json();
-
-  let lista: DiaTrabalhado[] = [];
-
-  if (Array.isArray(data)) {
-    lista = data;
-  } else if (Array.isArray(data?.registros)) {
-    lista = data.registros;
-  } else if (Array.isArray(data?.dias_trabalhados)) {
-    lista = data.dias_trabalhados;
-  }
+  const lista: DiaTrabalhado[] = Array.isArray(data) ? data : [];
 
   if (lista.length === 0) {
-    throw new Error('Nenhum registro encontrado.');
+    throw new Error('Nenhum registro encontrado para o seu nome no sistema de Banco de Horas.');
   }
 
   return lista.sort((a, b) =>
